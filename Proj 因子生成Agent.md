@@ -47,24 +47,46 @@
      "broker": "string|null",
      "inspiration": "string",
      "reasoning": "string",
+     "factor_formula": "string",
      "factor_python": "string",
      "required_inputs": ["string"],
-     "inavailable_inputs" ["string"]
+     "inavailable_inputs": ["string"]
    }
    ```
 
    - 默认约束：
      - `inspiration` 是因子动机，不是全文摘要。
      - `reasoning` 是“研报证据驱动的推理”，可以提取摘要式逻辑，不要求逐字复刻原文，使用的数据尽量来自data_dict.md
-        - 必须基于研报内容做摘要式推理，并以推导出的明确的因子数学表达式收尾
+        - 必须基于研报内容做摘要式推理，内容要像因子定义说明，不再承担公式字段
         - 内容要像因子定义说明，而不是读后总结
         - `inspiration` 和 `reasoning`必须直接描述金融现象、因子含义、市场规律和量化逻辑，不允许提到“研报”、“报告”，不允许写“研报指出”“报告认为”“文中提到”“作者认为”“该章节说明”等来源转述语句。
         - 不要总结写作过程，不要评价研报，不要出现“根据研报/从研报来看/本文/本报告/这一章节”等元叙述。
+     - `factor_formula` 单独记录因子公式
+        - 必须提供清晰、可读的数学表达式或定义
+        - 表达式变量名优先与 `required_inputs` 和 `data_dict.md` 中字段保持一致
+        - 若采用近似替代，需要与 `reasoning` 和 `inavailable_inputs` 保持一致
      - `factor_python` 由 LLM 根据研报内容生成，不要求研报原文已提供代码。
      - `required_inputs` 必须是可执行层面的字段名或数据表需求。
         - 只可以使用data_dict.md数据字典中提供的字段，如果没有请选择其中可以起到替代作用的
      - `inavailable_inputs`: data_dict.md无法找到但是需要的字段
      - 可追溯性当前主要依赖 `report_title`
+
+   - 样本示例：
+
+     ```python
+     {
+       "sample_id": "report_id_factor_idx",
+       "report_title": "string",
+       "report_date": "string|null",
+       "broker": "string|null",
+       "inspiration": "股价接近过去一年高点时，后续上涨空间可能收窄。",
+       "reasoning": "该因子衡量当前价格在过去一年价格区间中的相对位置，值越高表示股价越接近历史高位，潜在阻力越强。",
+       "factor_formula": "high_position_252 = close / rolling_max(close, 252)",
+       "factor_python": "def compute_factor(close):\\n    high_252 = close.rolling(window=252, min_periods=1).max()\\n    return close / high_252",
+       "required_inputs": ["close"],
+       "inavailable_inputs": []
+     }
+     ```
 
    - 生成的Python代码约束
 
@@ -78,7 +100,7 @@
 
      - 停牌字段限制：不允许使用 `paused` 字段作为输入或过滤条件；停牌股票已通过价格/成交量字段中的 `NaN` 体现，相关逻辑统一依赖缺失值传播与跳过机制处理。
 
-     - 字段白名单限制：`required_inputs` 和 `factor_python` 中允许引用的字段，必须严格来自文档中列出的字段集合。
+     - 字段白名单限制：`required_inputs`、`factor_formula` 中直接引用的字段，以及 `factor_python` 中允许引用的字段，必须严格来自文档中列出的字段集合。
        - 行情字段只允许使用 `extracter/data_dict.md` 的 `price` 表日度字段。
        - 基本面字段只允许使用 `extracter/data_dict.md` 中与聚宽文档一致的 `valuation`、`balance`、`income`、`indicator` 表字段。
        - 不允许新增文档外字段名，不允许把 `paused` 继续视为可用字段，不允许以分钟数据衍生出的日频中间字段充当输入
@@ -96,7 +118,7 @@
             - columns = 股票代码（如 000001.XSHE / 600000.XSHG）
             
         - 参考形式：
-            
+          
             - ```python
                  def compute_factor(close, volume, ...):
                      return factor_df
@@ -125,8 +147,9 @@
           - stage：dicovery/generate分别执行对应步骤
           - env-file：默认extracter/.env
           - output path: extracter/默认output
-          - max-factors-per-report：每篇研报允许抽取的最大不重复因子数量
-          - max_samples_generation: 对于第一阶段是生成的candidates的数量，对于第二阶段是生成的最终样本数量
+          - max-factors-per-report：传给模型的单篇研报参考因子数量，不作为本地删除阈值
+          - max_samples_generation: 仅用于第一阶段，表示生成的 candidates 数量
+          - max-concurrency：Generation 阶段同时在途的报告任务数量
           - max-qps：每秒钟最大llm调用的数量
 
       - pipeline.py ：负责流程编排，可以输入参数选择调用流程
@@ -139,9 +162,10 @@
           - output中生成candiates.csv
         - Stage2: Generation
           - 执行顺序
-            - parse pdf:读取output中的candidates.csv中的样本，进行解析
-            - async LLM and sample generation：调用兼容 OpenAI Chat Completions 的 LLM 接口，生成结构化样本。
-            - validation and export：通过程序校验结构正确性，再输出人工复核视图和失败记录。
+            - create workers: 为 output/candidates.csv 中的候选报告创建并发 worker，并以 `max-concurrency` 控制在途任务数
+            - parse pdf: 每个 worker 内独立解析 PDF
+            - async LLM and sample generation：每个 worker 调用兼容 OpenAI Chat Completions 的 LLM 接口，生成结构化样本
+            - validation and export：每个 worker 完成校验后，主流程按输入顺序归并结果，再输出人工复核视图和失败记录
         - 实现要求：
           - 候选筛选与样本生成解耦，可分别调用
           - 所有失败显式进入失败记录output/failures.csv，而不是静默丢弃
@@ -179,6 +203,8 @@
 
           - 校验内容
             - 核心字段非空
+            - `factor_formula` 必须存在，且是明确数学表达式或定义
+            - `factor_formula` 中如直接引用数据字典字段，应与 `required_inputs` 保持一致
             - `factor_python` 可通过 `ast.parse`
             - 函数参数需被 `required_inputs` 覆盖
             - `required_inputs` 必须存在于 `extracter/data_dict.md` 或表级需求中
@@ -189,7 +215,7 @@
 
       - LLM_client.py：实现LLM调用和样本生成
 
-        - 调用兼容 OpenAI 的 Chat Completions 接口，按 DeepSeek 接入。使用异步调用实现并发，设置限流器，允许输入QPS限流参数
+        - 调用兼容 OpenAI 的 Chat Completions 接口，按 DeepSeek 接入。使用异步 worker 调度实现并发，设置全局 QPS 限流器，并允许输入并发度参数
         - 设计要点：
           - 设计提示词
           - 提取的数据要符合前文定义的样本标准，包含所有字段
@@ -221,5 +247,439 @@
 
 ## SFT
 
-## DPO
+1. 监督微调任务目标：在 Extracter 从研报中沉淀出高质量结构化样本后，将“**金融现象理解 → 研究逻辑推导 → 因子公式表达 → Python实现**”这一研究范式注入基础模型，使模型具备面向量化因子研究任务的结构化生成能力。该阶段不是单纯让模型背诵因子模板，而是让模型学习以下能力：
 
+   - 根据输入的市场现象或研究观察(inspiration) 和任务描述，生成合理的因子研究思路；
+   - 将研究思路组织成清晰、规范、可追溯的 reasoning / factor_formula / factor_python 输出；
+   - 学习领域内常见的因子构建表达方式与金融逻辑；
+   - 学习在受限字段空间下进行近似建模，而不是随意发明不可用字段；
+   - 学习“输出可执行代码”和“输出经济含义解释”之间的一致性。
+
+2. 训练任务定义
+
+   - 任务形式：SFT 采用 **instruction tuning / chat-style supervised fine-tuning** 方式进行训练。每个样本由“输入任务描述 + 输出目标答案”构成，目标答案为完整结构化结果。
+
+     - 输入：市场现象 / 研究观察 / 约束条件 / 可用字段集合
+     - 输出：符合规范的结构化因子定义结果
+     - 训练时的目标不是只预测某一个字段，而是预测完整答案，使模型学会在单次响应中同时完成：
+       - 动机提炼
+       - 金融逻辑推理
+       - 数学表达
+       - Python实现
+       - 输入字段约束对齐
+
+   - 输入信息组成
+
+     - 每条训练样本的用户侧输入原则上由以下部分组成：
+
+       1. **任务描述**
+
+          - 系统提示：
+
+          - 给出一个现象、观察或研究目标`"inspiration": "string"`
+          - 例如：价格接近一年高点可能意味着后续上涨空间收窄
+
+       2. **可用字段约束**
+
+          - 来自 extracter/data_dict.md
+          - 明确只能使用哪些日频字段与表级字段
+          - 和extracter生成样本时的提示词约束进行对齐
+
+       3. **生成要求**
+
+          - 结构化输出
+          - 仅使用日度数据
+          - 不允许使用分钟级或文档外字段
+          - 代码必须为向量化宽表形式
+
+   - 输出目标
+
+     - 模型输出目标
+
+       - ```python
+         {
+           "reasoning": "string",
+           "factor_formula": "string",
+           "factor_python": "string",
+           "required_inputs": ["string"],
+           "inavailable_inputs": ["string"]
+         }
+         ```
+
+       - 中 SFT 重点学习以下字段之间的一致性：
+
+         - inspiration 与 reasoning 语义一致
+         - reasoning 与 factor_formula 定义一致
+         - factor_formula 与 factor_python 可相互对应
+         - required_inputs 能覆盖 factor_python 参数
+         - inavailable_inputs 能反映真实约束，而不是空泛占位
+
+3. 数据构建
+
+   - 数据清洗
+
+     - 进入 SFT 训练集之前，需要对 Extracter 输出样本进行二次清洗。清洗目标不是判断“能否交付”，而是判断“是否适合当作模型模仿对象”。
+     - 清洗规则包括：
+       - 删除 inspiration、reasoning 明显空泛、套话化的样本
+       - 删除 factor_formula 与 factor_python 不一致的样本
+       - 删除代码虽然可解析但经济含义明显错误的样本
+       - 删除字段约束不自洽的样本
+       - 删除严重重复样本，避免模型只学到表面模板
+       - 删除过度依赖原文转述语句的样本
+       - 删除因子逻辑与日频输入约束明显冲突的样本
+
+   - 数据分层
+
+     - 建议将 SFT 数据按难度分层组织，而不是简单混合训练。可以划分为三类：
+
+       - 基础模式样本：适合让模型先学会输出格式与字段约束，这类样本公式清晰，字段少，代码相对直接，例如：
+
+         - 价格相对位置类
+
+         - 波动率类
+
+         - 成交量占比类
+
+         - 简单量价关系类
+
+       - 中等复杂度样本：用于训练模型处理组合逻辑与近似替代，例如：
+
+         - 多字段组合因子
+
+         - 滚动统计类因子
+
+         - 需要对不可用字段进行替代表达的样本
+
+       - 高复杂度样本：用于训练模型保持研究解释和实现一致，例如：
+
+         - 带有经济含义转译的复杂表达
+
+         - 研报定义较抽象，需要转化为可执行公式的样本
+
+         - 同时涉及输入约束、替代逻辑与实现细节的样本
+
+       - 训练时可采用“先基础、后混合”的 curriculum 方式，提高稳定性。
+
+   - 训练样本格式
+
+     - 推荐统一使用多轮 chat 格式，以便后续与 DPO 阶段共用数据处理接口。单条样本形式如下：
+
+     - ```python
+       {
+         "messages": [
+           {"role": "system", "content": "...系统约束..."},
+           {"role": "user", "content": "...任务描述..."},
+           {"role": "assistant", "content": "...目标JSON输出..."}
+         ]
+       }
+       ```
+
+     - System Prompt 设计原则
+
+       - System 负责固化长期不变的任务规则，内容包括：
+         - 你是量化研究因子生成助手
+         - 输出必须为结构化 JSON
+         - 只可使用 data_dict.md 中允许的字段
+         - 仅依赖日度数据
+         - 不得使用 paused
+         - reasoning 必须是因子定义说明，而非来源复述
+         - factor_python 必须是单个 compute_factor 函数
+         - 输入是宽表向量化数据，不允许逐股票 for 循环
+       - System 不应过长，避免挤占上下文；项目级硬约束应尽量稳定。
+
+     - User Prompt 组成建议
+
+       - ```python
+         任务：根据给定现象与约束，生成单因子样本。
+         现象描述：
+         ...
+         
+         可用字段：
+         ...
+         
+         生成要求：
+         1. 输出 reasoning / factor_formula / factor_python / required_inputs / inavailable_inputs
+         2. 仅使用日频字段
+         3. 代码必须为向量化宽表形式
+         4. 若原始逻辑依赖不可用字段，请近似替代或写入 inavailable_inputs
+         5. 输出 JSON
+         ```
+
+     - Assistant 输出格式
+
+       - 固定为 JSON 字符串，不加额外解释文字，减少部署时的不稳定性。例如：
+
+       - ```python
+         {
+           "sample_id": "...",
+           "report_title": "...",
+           "report_date": "...",
+           "broker": "...",
+           "inspiration": "...",
+           "reasoning": "...",
+           "factor_formula": "...",
+           "factor_python": "def compute_factor(...):\n    ...",
+           "required_inputs": ["..."],
+           "inavailable_inputs": []
+         }
+         ```
+
+       - 实验结束，推理出的结果和模型输入重新按照样本格式拼接，通过id和原样本拼接成xlsx文件，方便对比校验
+
+4. 训练实现设计
+
+   - 目标产物
+
+     - 训练集、验证集、测试集
+     - 训练配置文件
+     - 训练脚本
+     - 最终 SFT Adapter 或全量模型权重
+     - 评估报告
+     - 推理 demo 与案例集
+
+   - 数据处理流程
+
+     - 读取 Extracter 输出的 samples.jsonl
+     - 执行高质量过滤与重复去重
+     - 生成 chat-format 样本
+     - 划分 train / val / test
+     - 序列化为训练框架需要的数据格式
+     - 记录数据版本号与统计信息
+
+   - 数据切分：按“**报告级别切分**”，而不是随机按样本切分。原因是同一篇报告中提取的多个因子样本在语言风格、研究逻辑和背景上高度相关，随机切分会导致泄漏。
+
+     - 建议划分方式：
+
+       - Train：80%
+
+       - Validation：10%
+
+       - Test：10%
+
+     - 保证
+
+       - 同一 report_title 只出现在一个集合中
+       - 不同集合中的券商、年份、主题分布尽量均衡
+
+   - 模型选择:
+
+     - Qwen3-0.6B模型
+
+   - 训练方式
+
+     - 采用 **LoRA / QLoRA 的参数高效微调**：
+       - 成本低
+       - 迭代快
+       - 易于与后续 DPO 共用底座
+       - 便于保留基础模型通用能力
+     - 训练目标采用标准 next-token prediction，但只对 assistant 输出部分计算损失，即：
+       - system 和 user 部分作为条件输入
+       - assistant 的 JSON 输出为监督目标
+
+   - 损失关注点
+
+     - 虽然底层仍是语言建模损失，但项目关注的不是单纯 perplexity，而是以下几类“有效学习信号”：
+       - 输出格式学习
+       - 字段一致性学习
+       - 金融逻辑到公式的映射学习
+       - 公式到代码实现的映射学习
+       - 约束条件遵守能力
+     - 因此在训练前的数据质量，比单纯增加样本量更重要。
+
+5. 训练配置
+
+   - 输入长度设计：单条样本通常包含
+
+     - system 规则
+
+     - user 任务与字段约束
+
+     - assistant 全量 JSON
+
+   - 因此需要预估上下文长度，避免过度截断。建议：
+
+     - max_prompt_length 保证能完整保留 system + user
+
+     - max_seq_length 能覆盖 assistant 输出中的代码段
+
+   - 若长度受限，优先保留：
+
+     - system 规则
+
+     - 用户现象描述
+
+     - 可用字段约束
+
+     - assistant 输出完整性
+
+     - 不应截断 assistant JSON 的尾部，否则会破坏训练分布。
+
+   - 训练超参数原则
+
+     - 使用较小学习率，避免破坏基础模型语义能力
+
+     - 保持足够的 warmup
+
+     - 使用 validation loss 与结构化指标共同早停
+
+     - 优先稳定收敛，而不是追求极限训练轮数
+
+     - 同步记录数据版本、模型版本、训练配置版本
+
+   - 训练轮次
+
+     - 建议从少量 epoch 起步，根据验证集效果决定是否继续。该任务具有较强模板性和领域局部性，过多 epoch 容易导致：
+
+     - 输出模板僵化
+
+     - 语言表达单一
+
+     - 对训练样本过拟合
+
+     - 见到新现象时泛化能力下降
+
+6. 模型评估
+
+   - 评估设计：SFT 阶段的评估不能只看 loss，必须分成“格式正确性、实现正确性、研究合理性”三层。
+
+   - 自动评估指标
+
+     - 结构化输出成功率：统计模型输出中
+
+       - 是否为合法 JSON
+
+       - 是否包含全部字段
+
+       - 字段类型是否正确
+
+     - 代码可解析率：对 factor_python 执行 ast.parse，统计可解析比例。
+
+     - 字段白名单合规率：检查
+
+       - required_inputs 是否都在白名单中
+
+       - factor_formula 是否引用非法字段
+
+       - factor_python 是否使用非法字段
+
+       - 是否使用 paused 或分钟级暗含字段
+
+     - 参数覆盖率：检查函数参数是否被 required_inputs 覆盖。
+
+     - 约束遵守率：检查最终输入回测接口后可以完成回测的可用比率
+
+   - 语义一致性评估：自动规则之外，还应评估字段间一致性，这部分用规则 + LLM-as-judge 混合评估。
+
+     - inspiration 与 reasoning 是否讲的是同一类现象
+
+     - reasoning 与 factor_formula 是否一致
+
+     - factor_formula 与 factor_python 是否一致
+
+     - required_inputs 与代码参数是否一致
+
+   - 最终验收标准：SFT 阶段应至少满足：
+
+     - 模型能稳定输出合法结构化结果
+
+     - 大部分样本代码可解析并通过规则校验
+
+     - 模型对字段空间约束有稳定遵循能力
+
+     - 模型能从自然语言现象描述生成较合理的因子定义
+
+     - 相较未微调基座模型，在领域任务上有明显提升
+
+7. 推理接口
+
+   - SFT 模型在部署时，主要承担“研究草案生成器”的角色。建议对外提供统一推理接口：
+
+     - 输入
+
+       - 现象描述
+
+       - 可用字段集合
+
+       - 任务约束
+
+     - 输出
+       - 结构化因子定义 JSON
+
+8. 主要模块
+
+   - Dataset Builder：负责从 extracter/output/samples.jsonl 构建训练数据
+     - 清洗
+     - 去重
+     - 数据增强
+     - 划分 train/val/test
+     - 转 chat 格式
+   - Prompt Builder：负责构造统一的 system / user / assistant 模板，保证训练与推理输入分布尽量一致
+   - Trainer：负责模型加载、LoRA/QLoRA 配置、训练、验证、checkpoint 保存。
+   - Evaluator：负责自动评估与案例抽样，包括
+     - JSON 合法性
+     - 代码可解析性
+     - 字段合规性
+     - 语义一致性
+     - 人工评审样本导出
+   - Inference Demo：提供简单脚本，对给定现象或观察生成因子草案，供后续 Agent 集成调用。
+
+9. 输出产物
+
+   ```
+   SFT 模块的输出文件建议包括：
+   	•	sft/data/train.jsonl
+   	•	sft/data/val.jsonl
+   	•	sft/data/test.jsonl
+   	•	sft/configs/train_config.yaml
+   	•	sft/checkpoints/...
+   	•	sft/output/eval_report.json
+   	•	sft/output/case_studies.md
+   ```
+
+   - 其中 eval_report.json 建议至少包含：
+
+     - 数据量统计
+
+     - 训练/验证 loss
+
+     - JSON 成功率
+
+     - 代码可解析率
+
+     - 字段合规率
+
+10. 排期
+
+    - Phase 1：数据准备
+
+      - 完成 Extracter 输出样本的质量复查
+
+      - 建立 SFT 清洗规则
+
+      - 生成第一版 train/val/test
+
+    - Phase 2：训练打通
+
+      - 完成 chat-format 数据构造
+
+      - 跑通基础 SFT 训练
+
+      - 完成最小可用推理 demo
+
+    - Phase 3：评估与迭代
+
+      - 建立自动评估脚本
+
+      - 人工抽样评估案例
+
+      - 分析失败类型并回流修改数据与 prompt
+
+    - Phase 4：为 DPO 做准备
+
+      - 收集 SFT 模型在验证集上的多个候选输出
+
+      - 标注偏好对
+
+      - 沉淀 DPO 数据构建流程
+
+## DPO

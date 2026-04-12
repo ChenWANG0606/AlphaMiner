@@ -11,7 +11,8 @@ DEFAULT_STAGE = "discovery"
 DEFAULT_CONTEXT_MODE = "section"
 DEFAULT_MAX_FACTORS_PER_REPORT = 10
 DEFAULT_MAX_SAMPLES_GENERATION = 20
-DEFAULT_MAX_QPS = 20.0
+DEFAULT_MAX_CONCURRENCY = 8
+DEFAULT_MAX_QPS = 30.0
 DEFAULT_GENERATION_SYSTEM_PROMPT = dedent(
 """
 你是量化因子抽取助手，目标是从候选文本中构造“可计算单因子”。
@@ -27,15 +28,19 @@ DEFAULT_GENERATION_SYSTEM_PROMPT = dedent(
 每个 sample 必须包含：
 - inspiration
 - reasoning
+- factor_formula
 - factor_python
 - required_inputs
 - inavailable_inputs
 
-【inspiration / reasoning】
+【inspiration / reasoning / factor_formula】
 - 必须直接描述金融现象、市场规律、量化逻辑
 - 禁止出现任何来源描述或元叙述：
   禁止：研报、报告、本文、作者认为、文中提到等
-- reasoning 必须是“推导式说明”，最后必须以明确数学表达式或定义收尾
+- reasoning 必须是“推导式说明”，只负责解释因子逻辑与定义，不要在末尾重复公式
+- factor_formula 必须单独给出明确、可读的数学表达式或定义
+- factor_formula 中的变量名优先使用 required_inputs 中的英文名，并尽量与数据字典字段一致
+- 若因子采用近似替代，factor_formula、reasoning 与 inavailable_inputs 三者必须相互一致
 
 【required_inputs】
 - 只能使用给定字段白名单中的字段名（如 close, volume, money 等）
@@ -61,7 +66,7 @@ DEFAULT_GENERATION_SYSTEM_PROMPT = dedent(
 
 【代码风格】
 - 禁止 print / logging
-- 禁止注释
+- 禁止在代码中写注释
 - 可使用中间变量
 
 【inavailable_inputs】
@@ -78,10 +83,10 @@ DEFAULT_GENERATION_USER_PROMPT_TEMPLATE = dedent(
     报告日期: {report_date}
     券商: {broker}
     上下文模式: {context_mode}
-    最多输出样本数: {max_factors_per_report}
+    参考输出样本数: {max_factors_per_report}
 
     输出格式必须是 JSON 对象，形如：
-    {{"samples": [{{"inspiration": "...", "reasoning": "...", "factor_python": "...", "required_inputs": ["close"], "inavailable_inputs": []}}]}}
+    {{"samples": [{{"inspiration": "...", "reasoning": "...", "factor_formula": "...", "factor_python": "...", "required_inputs": ["close"], "inavailable_inputs": []}}]}}
 
     允许使用的字段白名单:
     {allowed_fields}
@@ -117,6 +122,7 @@ class RuntimeConfig:
     data_dict_path: Path
     max_factors_per_report: int
     max_samples_generation: int
+    max_concurrency: int
     max_qps: float
     llm: LLMConfig
     prompts: PromptConfig
@@ -150,6 +156,7 @@ def build_runtime_config(
     output_path: str | Path | None = None,
     max_factors_per_report: int = DEFAULT_MAX_FACTORS_PER_REPORT,
     max_samples_generation: int = DEFAULT_MAX_SAMPLES_GENERATION,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     max_qps: float = DEFAULT_MAX_QPS,
 ) -> RuntimeConfig:
     base_dir = Path(__file__).resolve().parent
@@ -177,6 +184,7 @@ def build_runtime_config(
         data_dict_path=base_dir / "data_dict.md",
         max_factors_per_report=max_factors_per_report,
         max_samples_generation=max_samples_generation,
+        max_concurrency=max(1, max_concurrency),
         max_qps=max_qps,
         llm=llm,
         prompts=prompts,

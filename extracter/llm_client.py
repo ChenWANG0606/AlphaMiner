@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import json
+from threading import Lock
 from time import monotonic, sleep
 from urllib import error, request
 
@@ -23,6 +24,7 @@ class LLMClient:
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
         self._last_request_time = 0.0
+        self._throttle_lock = Lock()
 
     async def generate_json(self, request_payload: LLMRequest, *, max_qps: float) -> dict:
         return await asyncio.to_thread(self._generate_json_sync, request_payload, max_qps)
@@ -73,11 +75,12 @@ class LLMClient:
         if max_qps <= 0:
             return
         interval = 1.0 / max_qps
-        now = monotonic()
-        elapsed = now - self._last_request_time
-        if elapsed < interval:
-            sleep(interval - elapsed)
-        self._last_request_time = monotonic()
+        with self._throttle_lock:
+            now = monotonic()
+            elapsed = now - self._last_request_time
+            if elapsed < interval:
+                sleep(interval - elapsed)
+            self._last_request_time = monotonic()
 
 
 def _resolve_chat_completions_url(base_url: str) -> str:

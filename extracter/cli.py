@@ -7,6 +7,7 @@ from dataclasses import asdict
 from .configs import (
     DEFAULT_CONTEXT_MODE,
     DEFAULT_ENV_FILE,
+    DEFAULT_MAX_CONCURRENCY,
     DEFAULT_MAX_FACTORS_PER_REPORT,
     DEFAULT_MAX_QPS,
     DEFAULT_MAX_SAMPLES_GENERATION,
@@ -43,19 +44,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-factors-per-report",
         type=int,
         default=DEFAULT_MAX_FACTORS_PER_REPORT,
-        help="Maximum deduplicated factor count per report.",
+        help="Prompt hint for the target factor count per report; no local truncation is applied.",
     )
     parser.add_argument(
         "--max-samples-generation",
         type=int,
         default=DEFAULT_MAX_SAMPLES_GENERATION,
-        help="Stage-specific upper bound for candidates or samples.",
+        help="Discovery-stage upper bound for candidate reports.",
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=DEFAULT_MAX_CONCURRENCY,
+        help="Maximum number of in-flight generation workers.",
     )
     parser.add_argument(
         "--max-qps",
         type=float,
         default=DEFAULT_MAX_QPS,
-        help="Maximum LLM QPS.",
+        help="Maximum global LLM request rate.",
     )
     return parser
 
@@ -70,6 +77,7 @@ def main() -> int:
         output_path=args.output_path,
         max_factors_per_report=args.max_factors_per_report,
         max_samples_generation=args.max_samples_generation,
+        max_concurrency=args.max_concurrency,
         max_qps=args.max_qps,
     )
     result = run_pipeline(config)

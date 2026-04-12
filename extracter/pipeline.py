@@ -16,7 +16,7 @@ from .utils.io_utils import (
     write_jsonl,
 )
 from .utils.progress import progress
-from .validation.report_rating import CandidateReport, discover_candidate_sections, rate_reports
+from .validation.report_rating import discover_candidate_sections, rate_reports
 from .validation.result_validation import validate_generated_sample
 
 
@@ -29,6 +29,13 @@ class PipelineResult:
     candidates_path: str | None = None
     failures_path: str | None = None
     notes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class GenerationTaskResult:
+    row_index: int
+    samples: list[dict]
+    failures: list[FailureRecord]
 
 
 def run_pipeline(config: RuntimeConfig) -> PipelineResult:
@@ -121,34 +128,74 @@ async def _run_generation_async(
     data_dictionary: DataDictionary,
 ) -> tuple[list[dict], list[FailureRecord]]:
     client = LLMClient(config.llm)
-    failures: list[FailureRecord] = []
+    if not candidate_rows:
+        return [], []
+
+    semaphore = asyncio.Semaphore(config.max_concurrency)
+    tasks = [
+        asyncio.create_task(
+            _process_candidate_row(
+                row_index=index,
+                row=row,
+                client=client,
+                config=config,
+                data_dictionary=data_dictionary,
+                semaphore=semaphore,
+            )
+        )
+        for index, row in enumerate(candidate_rows)
+    ]
+
+    completed_results: list[GenerationTaskResult] = []
+    for task in progress(asyncio.as_completed(tasks), total=len(tasks), desc="Generation"):
+        completed_results.append(await task)
+
+    ordered_results = sorted(completed_results, key=lambda result: result.row_index)
     samples: list[dict] = []
-    limited_rows = candidate_rows[: config.max_samples_generation]
-    for row in progress(limited_rows, total=len(limited_rows), desc="Generation"):
-        if len(samples) >= config.max_samples_generation:
-            break
+    failures: list[FailureRecord] = []
+    for result in ordered_results:
+        failures.extend(result.failures)
+        samples.extend(result.samples)
+    return samples, failures
+
+
+async def _process_candidate_row(
+    *,
+    row_index: int,
+    row: dict[str, str],
+    client: LLMClient,
+    config: RuntimeConfig,
+    data_dictionary: DataDictionary,
+    semaphore: asyncio.Semaphore,
+) -> GenerationTaskResult:
+    async with semaphore:
         report_title = row.get("report_title", "")
+        report_date = row.get("report_date") or None
+        broker = row.get("broker") or None
         report_path = row.get("report_path", "")
         try:
-            parsed = parse_pdf(report_path)
+            parsed = await asyncio.to_thread(parse_pdf, report_path)
             context_payload = _build_context_payload(
                 parsed_full_text=parsed.full_text,
                 context_mode=config.context_mode,
             )
             if context_payload is None:
-                failures.append(
-                    FailureRecord(
-                        stage="generate",
-                        report_title=report_title,
-                        reason_type="NO_FACTOR_FOUND",
-                        reason="No high-confidence candidate section was found for generation.",
-                    )
+                return GenerationTaskResult(
+                    row_index=row_index,
+                    samples=[],
+                    failures=[
+                        FailureRecord(
+                            stage="generate",
+                            report_title=report_title,
+                            reason_type="NO_FACTOR_FOUND",
+                            reason="No high-confidence candidate section was found for generation.",
+                        )
+                    ],
                 )
-                continue
             request = _build_generation_request(
                 report_title=report_title,
-                report_date=row.get("report_date") or None,
-                broker=row.get("broker") or None,
+                report_date=report_date,
+                broker=broker,
                 context_mode=config.context_mode,
                 context_payload=context_payload,
                 data_dictionary=data_dictionary,
@@ -157,76 +204,105 @@ async def _run_generation_async(
             )
             response_payload = await client.generate_json(request, max_qps=config.max_qps)
         except LLMClientError as exc:
-            failures.append(
-                FailureRecord(
-                    stage="generate",
-                    report_title=report_title,
-                    reason_type="OTHER",
-                    reason=str(exc),
-                )
+            return GenerationTaskResult(
+                row_index=row_index,
+                samples=[],
+                failures=[
+                    FailureRecord(
+                        stage="generate",
+                        report_title=report_title,
+                        reason_type="OTHER",
+                        reason=str(exc),
+                    )
+                ],
             )
-            continue
         except Exception as exc:  # noqa: BLE001
-            failures.append(
-                FailureRecord(
-                    stage="generate",
-                    report_title=report_title,
-                    reason_type="OTHER",
-                    reason=str(exc),
-                )
+            return GenerationTaskResult(
+                row_index=row_index,
+                samples=[],
+                failures=[
+                    FailureRecord(
+                        stage="generate",
+                        report_title=report_title,
+                        reason_type="OTHER",
+                        reason=str(exc),
+                    )
+                ],
             )
-            continue
 
-        raw_samples = response_payload.get("samples")
-        if not isinstance(raw_samples, list):
-            failures.append(
+        return _collect_generation_result(
+            row_index=row_index,
+            row=row,
+            response_payload=response_payload,
+            report_title=report_title,
+            report_date=report_date,
+            broker=broker,
+            data_dictionary=data_dictionary,
+        )
+
+
+def _collect_generation_result(
+    *,
+    row_index: int,
+    row: dict[str, str],
+    response_payload: dict,
+    report_title: str,
+    report_date: str | None,
+    broker: str | None,
+    data_dictionary: DataDictionary,
+) -> GenerationTaskResult:
+    failures: list[FailureRecord] = []
+    samples: list[dict] = []
+    raw_samples = response_payload.get("samples")
+    if not isinstance(raw_samples, list):
+        return GenerationTaskResult(
+            row_index=row_index,
+            samples=[],
+            failures=[
                 FailureRecord(
                     stage="generate",
                     report_title=report_title,
                     reason_type="INVALID_JSON",
                     reason="LLM payload must contain a samples list.",
                 )
+            ],
+        )
+
+    sample_index = 0
+    for raw_sample in raw_samples:
+        if not isinstance(raw_sample, dict):
+            failures.append(
+                FailureRecord(
+                    stage="generate",
+                    report_title=report_title,
+                    reason_type="INVALID_JSON",
+                    reason="Each generated sample must be a JSON object.",
+                )
             )
             continue
-
-        deduplicated = 0
-        for raw_sample in raw_samples:
-            if len(samples) >= config.max_samples_generation:
-                break
-            if deduplicated >= config.max_factors_per_report:
-                break
-            if not isinstance(raw_sample, dict):
-                failures.append(
-                    FailureRecord(
-                        stage="generate",
-                        report_title=report_title,
-                        reason_type="INVALID_JSON",
-                        reason="Each generated sample must be a JSON object.",
-                    )
-                )
-                continue
-            errors = validate_generated_sample(raw_sample, data_dictionary)
-            if errors:
-                failures.append(
-                    FailureRecord(
-                        stage="generate",
-                        report_title=report_title,
-                        reason_type="INVALID_CODE",
-                        reason="; ".join(errors),
-                    )
-                )
-                continue
-            deduplicated += 1
-            samples.append(
-                _normalize_sample(
-                    raw_sample=raw_sample,
+        errors = validate_generated_sample(raw_sample, data_dictionary)
+        if errors:
+            failures.append(
+                FailureRecord(
+                    stage="generate",
                     report_title=report_title,
-                    report_date=row.get("report_date") or None,
-                    broker=row.get("broker") or None,
-                    sample_index=deduplicated,
+                    reason_type="INVALID_CODE",
+                    reason="; ".join(errors),
                 )
             )
-    return samples, failures
+            continue
+        sample_index += 1
+        samples.append(
+            _normalize_sample(
+                raw_sample=raw_sample,
+                report_title=row.get("report_title", report_title),
+                report_date=report_date,
+                broker=broker,
+                sample_index=sample_index,
+            )
+        )
+
+    return GenerationTaskResult(row_index=row_index, samples=samples, failures=failures)
 
 
 def _build_generation_request(
@@ -270,6 +346,7 @@ def _normalize_sample(
         "broker": broker,
         "inspiration": raw_sample["inspiration"].strip(),
         "reasoning": raw_sample["reasoning"].strip(),
+        "factor_formula": raw_sample["factor_formula"].strip(),
         "factor_python": raw_sample["factor_python"].strip(),
         "required_inputs": raw_sample["required_inputs"],
         "inavailable_inputs": raw_sample["inavailable_inputs"],
