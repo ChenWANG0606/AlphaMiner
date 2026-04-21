@@ -31,3 +31,4 @@ runtime:
   torch_dtype: bfloat16
   load_in_4bit: false
   trust_remote_code: true
+  eval_batch_size: 1

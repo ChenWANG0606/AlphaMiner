@@ -9,10 +9,12 @@ DEFAULT_ENV_FILE = ".env"
 DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_STAGE = "discovery"
 DEFAULT_CONTEXT_MODE = "section"
-DEFAULT_MAX_FACTORS_PER_REPORT = 10
+DEFAULT_MAX_FACTORS_PER_REPORT = 42
 DEFAULT_MAX_SAMPLES_GENERATION = 80
 DEFAULT_MAX_CONCURRENCY = 20
 DEFAULT_MAX_QPS = 80.0
+DEFAULT_SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
+DEFAULT_SILICONFLOW_MODEL = "deepseek-ai/DeepSeek-V3.2"
 DEFAULT_GENERATION_SYSTEM_PROMPT = dedent(
 """
 你是量化因子抽取助手，目标是从候选文本中构造“可计算单因子”。
@@ -165,9 +167,9 @@ def build_runtime_config(
     env_values = _load_env_file(resolved_env_file)
     output_dir = base_dir / DEFAULT_OUTPUT_DIR if output_path is None else Path(output_path)
     llm = LLMConfig(
-        base_url=env_values.get("LLM_BASE_URL"),
-        api_key=env_values.get("LLM_API_KEY"),
-        model=env_values.get("LLM_MODEL"),
+        base_url=env_values.get("SILICONFLOW_BASE_URL", DEFAULT_SILICONFLOW_BASE_URL),
+        api_key=env_values.get("SILICONFLOW_API_KEY"),
+        model=env_values.get("SILICONFLOW_MODEL", DEFAULT_SILICONFLOW_MODEL),
         timeout=_int_env(env_values, "LLM_TIMEOUT", 120),
         max_retries=_int_env(env_values, "LLM_MAX_RETRIES", 2),
     )

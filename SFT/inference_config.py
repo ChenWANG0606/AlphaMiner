@@ -36,6 +36,7 @@ class RuntimeConfig:
     torch_dtype: str
     load_in_4bit: bool
     trust_remote_code: bool
+    eval_batch_size: int
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,7 @@ def load_inference_config(path: str | Path = DEFAULT_INFERENCE_CONFIG_PATH) -> I
         torch_dtype=str(runtime_section.get("torch_dtype", "bfloat16")),
         load_in_4bit=bool(runtime_section.get("load_in_4bit", False)),
         trust_remote_code=bool(runtime_section.get("trust_remote_code", True)),
+        eval_batch_size=max(1, int(runtime_section.get("eval_batch_size", 1))),
     )
 
     project_root = resolved_path.parent.parent.parent

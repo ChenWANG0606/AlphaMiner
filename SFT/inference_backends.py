@@ -27,6 +27,9 @@ class InferenceBackend:
     def generate(self, messages: list[dict[str, str]]) -> BackendResponse:
         raise NotImplementedError
 
+    def generate_batch(self, messages_batch: list[list[dict[str, str]]]) -> list[BackendResponse]:
+        return [self.generate(messages) for messages in messages_batch]
+
 
 class OpenAICompatBackend(InferenceBackend):
     def __init__(self, config: InferenceConfig) -> None:
@@ -77,25 +80,45 @@ class LocalHFBackend(InferenceBackend):
         self._tokenizer = None
 
     def generate(self, messages: list[dict[str, str]]) -> BackendResponse:
+        return self.generate_batch([messages])[0]
+
+    def generate_batch(self, messages_batch: list[list[dict[str, str]]]) -> list[BackendResponse]:
+        if not messages_batch:
+            return []
+
+        import torch
+
         model, tokenizer = self._load_model_and_tokenizer()
-        model_inputs = self._build_model_inputs(tokenizer, messages)
+        model_inputs = self._build_batch_model_inputs(tokenizer, messages_batch)
         generate_kwargs = {
             "max_new_tokens": self._config.generation.max_new_tokens,
             "do_sample": self._config.generation.temperature > 0,
         }
         if generate_kwargs["do_sample"]:
             generate_kwargs["temperature"] = self._config.generation.temperature
-        outputs = model.generate(**model_inputs, **generate_kwargs)
-        generated_tokens = outputs[0][model_inputs["input_ids"].shape[-1] :]
-        raw_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        parsed_json, parse_error = parse_model_output(raw_text)
-        return BackendResponse(
-            raw_text=raw_text,
-            parsed_json=parsed_json,
-            parse_error=parse_error,
-            backend_type="local_hf",
-            model_name=self._model_name,
-        )
+
+        with torch.inference_mode():
+            outputs = model.generate(**model_inputs, **generate_kwargs)
+
+        prompt_width = model_inputs["input_ids"].shape[-1]
+        raw_texts: list[str] = []
+        for output_row in outputs:
+            generated_tokens = output_row[prompt_width:]
+            raw_texts.append(tokenizer.decode(generated_tokens, skip_special_tokens=True))
+
+        responses: list[BackendResponse] = []
+        for raw_text in raw_texts:
+            parsed_json, parse_error = parse_model_output(raw_text)
+            responses.append(
+                BackendResponse(
+                    raw_text=raw_text,
+                    parsed_json=parsed_json,
+                    parse_error=parse_error,
+                    backend_type="local_hf",
+                    model_name=self._model_name,
+                )
+            )
+        return responses
 
     @property
     def _model_name(self) -> str:
@@ -106,28 +129,27 @@ class LocalHFBackend(InferenceBackend):
         return "local_hf"
 
     def _build_model_inputs(self, tokenizer: Any, messages: list[dict[str, str]]):
+        return self._build_batch_model_inputs(tokenizer, [messages])
+
+    def _build_batch_model_inputs(
+        self,
+        tokenizer: Any,
+        messages_batch: list[list[dict[str, str]]],
+    ):
         import torch
 
-        if hasattr(tokenizer, "apply_chat_template"):
-            try:
-                encoded = tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    return_tensors="pt",
-                    return_dict=True,
-                )
-            except TypeError:
-                encoded = tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    return_tensors="pt",
-                )
-        else:
-            prompt_text = "\n\n".join(
-                f"{message['role']}: {message['content']}"
-                for message in messages
-            ) + "\n\nassistant:"
-            encoded = tokenizer(prompt_text, return_tensors="pt")
+        if hasattr(tokenizer, "padding_side"):
+            tokenizer.padding_side = "left"
+
+        prompt_texts = [
+            self._render_prompt_text(tokenizer, messages)
+            for messages in messages_batch
+        ]
+        encoded = tokenizer(
+            prompt_texts,
+            return_tensors="pt",
+            padding=True,
+        )
 
         if isinstance(encoded, torch.Tensor):
             input_ids = encoded
@@ -148,6 +170,22 @@ class LocalHFBackend(InferenceBackend):
             "input_ids": input_ids.to(device),
             "attention_mask": attention_mask.to(device),
         }
+
+    def _render_prompt_text(self, tokenizer: Any, messages: list[dict[str, str]]) -> str:
+        if hasattr(tokenizer, "apply_chat_template"):
+            try:
+                return tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            except TypeError:
+                pass
+
+        return "\n\n".join(
+            f"{message['role']}: {message['content']}"
+            for message in messages
+        ) + "\n\nassistant:"
 
     def _load_model_and_tokenizer(self):
         if self._model is not None and self._tokenizer is not None:

@@ -10,7 +10,7 @@ from extracter.validation.result_validation import validate_generated_sample
 
 from .inference_backends import BackendResponse, InferenceBackend
 from .inference_config import InferenceConfig
-from .progress import iter_progress
+from .progress import stage_progress
 from .prompt_builder import (
     GENERATION_OUTPUT_FIELDS,
     extract_inspiration_from_messages,
@@ -32,8 +32,10 @@ def evaluate_records(
     inference_config: InferenceConfig,
 ) -> EvaluationResult:
     data_dictionary = load_data_dictionary(inference_config.data_dict_path)
+    dataset_rows = [json.loads(raw_line) for raw_line in lines if raw_line.strip()]
     records: list[dict[str, Any]] = []
     failure_type_breakdown: dict[str, int] = {}
+    batch_size = inference_config.runtime.eval_batch_size
 
     metric_totals = {
         "valid_json": 0,
@@ -47,54 +49,66 @@ def evaluate_records(
         "factor_formula_exact_match": 0,
     }
 
-    for raw_line in iter_progress(lines, desc="Eval Samples", total=len(lines), unit="sample"):
-        if not raw_line.strip():
-            continue
-        dataset_row = json.loads(raw_line)
-        prompt_messages = _normalize_messages(dataset_row.get("prompt"))
-        try:
-            response = backend.generate(prompt_messages)
-        except Exception as exc:
-            response = BackendResponse(
-                raw_text="",
-                parsed_json=None,
-                parse_error=f"backend_error: {exc}",
-                backend_type=inference_config.backend.type,
-                model_name=inference_config.backend.model or "local_hf",
-            )
+    with stage_progress(total=len(dataset_rows), desc="Eval Samples", unit="sample") as progress_bar:
+        for batch_rows in _chunked(dataset_rows, batch_size):
+            prompt_messages_batch = [
+                _normalize_messages(dataset_row.get("prompt"))
+                for dataset_row in batch_rows
+            ]
+            try:
+                batch_responses = backend.generate_batch(prompt_messages_batch)
+            except Exception as exc:
+                batch_responses = _build_batch_error_responses(
+                    batch_size=len(batch_rows),
+                    error_text=f"backend_error: {exc}",
+                    inference_config=inference_config,
+                )
 
-        reference_payload, reference_errors = _load_reference_payload(dataset_row)
-        metadata = _extract_metadata(dataset_row, reference_payload)
-        prediction_payload, prediction_errors, metrics = _evaluate_prediction(
-            response=response,
-            reference_payload=reference_payload,
-            inspiration=metadata["inspiration"],
-            data_dictionary=data_dictionary,
-        )
+            if len(batch_responses) != len(batch_rows):
+                batch_responses = _build_batch_error_responses(
+                    batch_size=len(batch_rows),
+                    error_text=(
+                        "backend_error: backend returned "
+                        f"{len(batch_responses)} responses for {len(batch_rows)} prompts"
+                    ),
+                    inference_config=inference_config,
+                )
 
-        errors = [*reference_errors, *prediction_errors]
-        for metric_name, value in metrics.items():
-            if metric_name not in metric_totals:
-                continue
-            metric_totals[metric_name] += int(value)
-        for error_text in errors:
-            error_key = error_text.split(":", 1)[0]
-            failure_type_breakdown[error_key] = failure_type_breakdown.get(error_key, 0) + 1
+            for dataset_row, response in zip(batch_rows, batch_responses):
+                reference_payload, reference_errors = _load_reference_payload(dataset_row)
+                metadata = _extract_metadata(dataset_row, reference_payload)
+                prediction_payload, prediction_errors, metrics = _evaluate_prediction(
+                    response=response,
+                    reference_payload=reference_payload,
+                    inspiration=metadata["inspiration"],
+                    data_dictionary=data_dictionary,
+                )
 
-        records.append(
-            {
-                "sample_id": metadata["sample_id"],
-                "report_title": metadata["report_title"],
-                "report_date": metadata["report_date"],
-                "broker": metadata["broker"],
-                "inspiration": metadata["inspiration"],
-                "prediction": prediction_payload,
-                "reference": reference_payload,
-                "metrics": metrics,
-                "errors": errors,
-                "raw_response": response.raw_text,
-            }
-        )
+                errors = [*reference_errors, *prediction_errors]
+                for metric_name, value in metrics.items():
+                    if metric_name not in metric_totals:
+                        continue
+                    metric_totals[metric_name] += int(value)
+                for error_text in errors:
+                    error_key = error_text.split(":", 1)[0]
+                    failure_type_breakdown[error_key] = failure_type_breakdown.get(error_key, 0) + 1
+
+                records.append(
+                    {
+                        "sample_id": metadata["sample_id"],
+                        "report_title": metadata["report_title"],
+                        "report_date": metadata["report_date"],
+                        "broker": metadata["broker"],
+                        "inspiration": metadata["inspiration"],
+                        "prediction": prediction_payload,
+                        "reference": reference_payload,
+                        "metrics": metrics,
+                        "errors": errors,
+                        "raw_response": response.raw_text,
+                    }
+                )
+
+            progress_bar.advance(f"batch={len(batch_rows)}", amount=len(batch_rows))
 
     sample_count = len(records)
     summary = {
@@ -273,3 +287,28 @@ def _ratio(count: int, total: int) -> float:
     if total <= 0:
         return 0.0
     return round(count / total, 4)
+
+
+def _chunked(items: list[Any], chunk_size: int) -> list[list[Any]]:
+    return [
+        items[index : index + chunk_size]
+        for index in range(0, len(items), chunk_size)
+    ]
+
+
+def _build_batch_error_responses(
+    *,
+    batch_size: int,
+    error_text: str,
+    inference_config: InferenceConfig,
+) -> list[BackendResponse]:
+    return [
+        BackendResponse(
+            raw_text="",
+            parsed_json=None,
+            parse_error=error_text,
+            backend_type=inference_config.backend.type,
+            model_name=inference_config.backend.model or "local_hf",
+        )
+        for _ in range(batch_size)
+    ]
