@@ -1,0 +1,71 @@
+paths:
+  base_model_path: SFT/model/base
+  sft_adapter_path: SFT/trained/qwen3_0_6b_sft_lora
+  train_file: SFT/data/train.jsonl
+  candidates_file: DPO/data/candidates.jsonl
+  candidate_summary_file: DPO/data/candidate_summary.json
+  validated_candidates_file: DPO/data/validated_candidates.jsonl
+  validation_summary_file: DPO/data/validation_summary.json
+  data_dict_file: extracter/data_dict.md
+  dpo_train_file: DPO/data/dpo_train.jsonl
+  hard_cases_file: DPO/data/hard_cases.jsonl
+  preference_summary_file: DPO/data/preference_summary.json
+  dpo_adapter_path: DPO/trained/qwen3_0_6b_dpo_lora
+  val_file: SFT/data/val.jsonl
+  test_file: SFT/data/test.jsonl
+  eval_report_file: DPO/output/eval_report.json
+  case_studies_file: DPO/output/case_studies.md
+
+candidate_generation:
+  group_size: 4
+  temperature: 0.8
+  top_p: 0.9
+  max_new_tokens: 1024
+  seed: 42
+  overwrite: false
+  batch_size: 1
+  device: auto
+  torch_dtype: bfloat16
+  load_in_4bit: false
+  trust_remote_code: true
+
+validation:
+  require_backtest: true
+  ic_horizon: 1
+  overwrite: false
+
+preference:
+  primary_metric: abs_ic_1
+  allow_single_success_pair: true
+  min_abs_ic_gap: 0.0
+  overwrite: false
+
+training:
+  trainer: DPOTrainer
+  beta: 0.1
+  learning_rate: 0.000005
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  max_prompt_length: 1536
+  max_length: 3072
+  seed: 42
+  overwrite: false
+  device: auto
+  torch_dtype: bfloat16
+  load_in_4bit: false
+  trust_remote_code: true
+  gradient_checkpointing: true
+  logging_steps: 10
+  save_steps: 100
+
+evaluation:
+  temperature: 0.0
+  top_p: 1.0
+  max_new_tokens: 1024
+  seed: 42
+  device: auto
+  torch_dtype: bfloat16
+  load_in_4bit: false
+  trust_remote_code: true
+  batch_size: 1
