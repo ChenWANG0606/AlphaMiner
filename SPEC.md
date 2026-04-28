@@ -684,48 +684,150 @@
 
 ## DPO
 
-1. DPO任务目标：DPO的任务目标在于1.提升生成质量有效质量， 2. 提升生成因子的IC表现。
+1. 任务目标
 
-2. 任务的总体执行流程：
-   - DPO样本构建
-     - 加载SFT模型，加载训练集样本，按照group（e.g. g = 4）生成样本
-     - 按组进行校验
-       - 前文进行的各种因子python函数有效检验
-       - IC回测
-     - 样本对构建
-       - 如果组内样本全部能回测出IC结果，选择IC绝对值最高和绝对值最低的构建正负样本对
-       - 如果部分可以回测出结果，选择IC绝对值最高的和python函数校验不通过组成正负样本对
-       - 如果完全无法回测出结果，抛弃该样本，并且将丢弃的该样本元信息统一保存的output文件夹中的hard_case.json
-         - 注意不用保存每个SFT生成的内容，而是只保留原始样本
-   - DPO训练
-     - 加载所有训练集生成的SFT样本，对DPO进行训练
-   - 复用SFT的评估链路
-     - 结构化输出成功率：统计模型输出中
+   DPO 阶段的目标是在 SFT 已经学会基础输出格式和领域约束的基础上，进一步对齐“可用因子优于不可用因子、回测表现更好的因子优于表现更差因子”的研究偏好。具体目标包括：
 
-       - 是否为合法 JSON
+   - 提升结构化 JSON 输出成功率、字段合规率、Python 可解析率和回测通过率。
+   - 在通过硬约束的前提下，提升生成因子的 1 日 `|IC|` 表现。
+   - 保持与 SFT 完全一致的 assistant 输出契约，不新增输出字段，不改变下游解析逻辑。
 
-       - 是否包含全部字段
+2. 数据范围与防泄漏原则
 
-       - 字段类型是否正确
-     - 代码可解析率：对 factor_python 执行 ast.parse，统计可解析比例。
+   - DPO 候选生成只使用 `SFT/data/train.jsonl`。
+   - `SFT/data/val.jsonl` 和 `SFT/data/test.jsonl` 不参与 DPO 训练，只用于 SFT checkpoint 与 DPO checkpoint 的横向评估。
+   - DPO 的 prompt 直接复用 SFT 阶段的 system / user messages；DPO 不重新定义任务输入格式。
+   - DPO 的 chosen / rejected 均为 assistant JSON 字符串，字段限定为：
 
-     - 字段白名单合规率：检查
+     ```json
+     {
+       "reasoning": "...",
+       "factor_formula": "...",
+       "factor_python": "def compute_factor(...):\n    ...",
+       "required_inputs": ["..."],
+       "inavailable_inputs": []
+     }
+     ```
 
-       - required_inputs 是否都在白名单中
+3. DPO 样本构建流程
 
-       - factor_formula 是否引用非法字段
+   - 加载已训练 SFT adapter。
+   - 加载 `SFT/data/train.jsonl` 中的训练样本。
+   - 对每条 train prompt 按组生成多个候选，默认 `g = 4`；后续实现可将 `g` 做成配置项。
+   - 每个候选至少保留以下信息：
+     - 原始 prompt。
+     - 候选序号。
+     - raw output。
+     - 规范化后的 JSON payload。
+     - 结构化解析与字段校验结果。
+     - Python 语法与函数签名校验结果。
+     - 回测是否成功。
+     - 若回测成功，记录 1 日 IC、1 日 Rank IC、IR 等回测摘要指标。
+   - 候选生成失败、JSON 解析失败、字段缺失、字段非法、Python 解析失败、函数参数不匹配、回测失败都必须记录失败类型，便于后续分析失败分布。
 
-       - factor_python 是否使用非法字段
+4. 校验链路复用原则
 
-       - 是否使用 paused 或分钟级暗含字段
+   DPO 不单独引入新的 Eval 模块作为主要依赖，而是尽量复用当前已经稳定的 `extracter`、`SFT` 和 `backtest` 校验能力：
 
-     - 参数覆盖率：检查函数参数是否被 required_inputs 覆盖。
+   - 结构化解析、字段规范化、required_inputs 与 `compute_factor` 参数一致性检查，优先复用 `SFT/evaluator.py` 与 `SFT/prompt_builder.py` 中已有逻辑。
+   - 字段白名单、不可用字段、日频约束、`paused` 禁用、非法字段引用等规则，复用 `extracter.validation.result_validation`。
+   - Python 语法校验继续使用 `ast.parse`。
+   - 可回测性和 IC 结果复用 `backtest` 现有链路。
 
-     - 约束遵守率：检查最终输入回测接口后可以完成回测的可用比率
+5. 偏好对构建规则
 
-## Eval
+   DPO 偏好对采用自动构建为主，人工复核只用于抽查和 hard case 复盘，不作为训练数据生成的阻塞步骤。
 
-1. Eval模块从DPO、SFT、Extracter提取出公共的评测api避免重复造轮子
+   - 若同一 prompt 组内至少两个候选可回测：
+     - 按 1 日 `|IC|` 从高到低排序。
+     - 1 日 `|IC|` 最高的候选作为 chosen。
+     - 1 日 `|IC|` 最低的候选作为 rejected。
+   - 若组内只有一个候选可回测：
+     - 该可回测候选作为 chosen。
+     - rejected 从组内硬约束失败的候选中选择，优先选择失败等级更严重的样本，例如 JSON 不合法、缺失必要字段、Python 不可解析、函数参数不匹配、字段白名单违规、回测失败。
+   - 若组内没有任何候选可回测：
+     - 该原始样本不进入 DPO 训练集。
+     - 将原始样本元信息和失败摘要写入 `output/hard_case.json` 或 DPO 模块后续约定的 output 目录。
+     - hard case 中不保存每个 SFT 生成内容全文，只保留原始样本元信息、失败类型统计和必要定位信息。
+
+6. DPO 训练数据格式
+
+   单条 DPO 训练样本采用如下结构：
+
+   ```python
+   {
+     "prompt": [
+       {"role": "system", "content": "..."},
+       {"role": "user", "content": "..."}
+     ],
+     "chosen": "{\"reasoning\": \"...\", \"factor_formula\": \"...\", \"factor_python\": \"...\", \"required_inputs\": [...], \"inavailable_inputs\": [...]}",
+     "rejected": "{\"reasoning\": \"...\", \"factor_formula\": \"...\", \"factor_python\": \"...\", \"required_inputs\": [...], \"inavailable_inputs\": [...]}",
+     "metadata": {
+       "sample_id": "...",
+       "report_title": "...",
+       "candidate_group_size": 4,
+       "chosen_metric": {"ic_1": 0.05},
+       "rejected_metric": {"ic_1": 0.01},
+       "preference_rule": "highest_abs_ic_1_vs_lowest_abs_ic_1"
+     }
+   }
+   ```
+
+   其中：
+
+   - `prompt` 必须与 SFT 训练 / 推理 prompt 格式兼容。
+   - `chosen` 与 `rejected` 必须是 assistant content 字符串，而不是额外嵌套的 dict。
+   - `metadata` 仅用于追踪样本来源、构建规则和评估分析，不作为模型输出目标。
+
+7. DPO 训练
+
+   - DPO 训练以 SFT adapter 为起点继续进行偏好对齐。
+   - 训练配置应尽量复用 SFT 阶段的模型加载、LoRA / QLoRA、tokenizer 和输出目录管理方式。
+   - DPO 的训练目标是让模型在同一 prompt 下提高 chosen 相对 rejected 的概率，而不是学习新的 JSON schema。
+   - 训练产物应保存 adapter、tokenizer、训练日志和运行 manifest，manifest 中记录：
+     - SFT checkpoint 来源。
+     - DPO 数据版本。
+     - 候选组大小 `g`。
+     - 偏好对构建规则。
+     - 训练超参数。
+
+8. 评估口径
+
+   DPO 评估不依赖独立 Eval 模块，主要复用 SFT 和 extracter 中已存在的校验逻辑，并额外接入 backtest 指标。
+
+   - 结构化输出成功率：
+     - 是否为合法 JSON。
+     - 是否包含全部必要字段。
+     - 字段类型是否正确。
+   - validator pass rate：
+     - 是否通过 `extracter.validation.result_validation` 中的字段、约束和白名单校验。
+   - 代码可解析率：
+     - 对 `factor_python` 执行 `ast.parse`，统计可解析比例。
+   - 参数匹配率：
+     - `compute_factor` 参数是否与 `required_inputs` 完全一致。
+   - 字段白名单合规率：
+     - `required_inputs` 是否都在白名单中。
+     - `factor_formula` 是否引用非法字段。
+     - `factor_python` 是否使用非法字段。
+     - 是否使用 `paused`、分钟级或其他日内暗含字段。
+   - 回测通过率：
+     - 模型输出输入回测接口后是否可以完成回测。
+   - IC 表现：
+     - 统计 1 日 `|IC|` 的均值、中位数、分位数。
+     - 记录 1 日 Rank IC、IR 等辅助指标，但默认偏好对排序仍以 1 日 `|IC|` 为主。
+   - 对比方式：
+     - 在同一批 `val/test` prompt 上分别运行 SFT checkpoint 与 DPO checkpoint。
+     - 输出 DPO 相对 SFT 的结构化指标变化、回测通过率变化和 1 日 `|IC|` 分布变化。
+
+9. 产物约定
+
+   DPO 阶段至少沉淀以下产物：
+
+   - 候选生成记录：保存每个 train prompt 的候选摘要、校验结果和回测摘要。
+   - DPO 偏好训练集：保存 `{prompt, chosen, rejected, metadata}` 格式样本。
+   - hard case 文件：保存无法构建偏好对的原始样本元信息和失败摘要。
+   - DPO 训练产物：保存 adapter、tokenizer、日志和运行 manifest。
+   - DPO 评估报告：保存 SFT 与 DPO 在 `val/test` 上的结构化指标、回测通过率和 1 日 `|IC|` 对比结果。
 
 
 ## Backtest
