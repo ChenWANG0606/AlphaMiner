@@ -66,6 +66,10 @@
 - `output/error_log_{timestamp}.txt`：批量执行时，语法报错或缺少数据字段因子的调试追踪日志。
 - `output/{factor_id}_quantile_returns.png`：单点调试时，指定因子在截面多头与空头端的各分层平均远期收益柱状图。
 - `output/{factor_id}_cumulative_returns.png`：单点调试时，指定因子多空各分段的累计净值走势折线图。
+- `output/{factor_id}_topn_nav.png`：单点调试时，指定因子买入头部组合（Top-N）的净值与超额收益走势图。
+- `output/{factor_id}_long_short_cumulative.png`：单点调试时，指定因子多空对冲组合（Long-Short）累计收益折线图。
+- `output/{factor_id}_ic_timeseries.png`：单点调试时，指定因子的每日 IC、Rank IC 及均线时序波动走势图。
+
 
 ## 6. 环境配置与运行指南
 
@@ -100,7 +104,7 @@ python data_fetcher.py
 ```bash
 python main.py
 ```
-可根据需要修改 `run_pipeline(target_factor_id='factor_43')` 来独立测算并画出单个因子的详情页图表。结果日志与图像将输出至 `output/` 目录。
+可根据需要修改 `run_pipeline(target_factor_id='factor_37')` 来独立测算并画出单个因子的详情页图表。结果日志与图像将输出至 `output/` 目录。
 
 ## 7. 系统核心评估指标与图表判读
 
@@ -128,7 +132,7 @@ python main.py
 #### A. 各分层平均收益图 (Bar Chart)
 该柱状图衡量各个分段在对应周期后的收益均值表现。
 
-![分层平均收益示例](output/factor_43_quantile_returns.png)
+![分层平均收益示例](output/factor_37_quantile_returns.png)
 *(注：跑单因子测试后会自动生成至 `output/` 目录)*
 
 **图表判读**：
@@ -137,10 +141,32 @@ python main.py
 #### B. 分层累计收益走势图 (Line Chart)
 该折线图计算了测试阶段内各分段多空买入持有的净值演化。
 
-![分层累计收益示例](output/factor_43_cumulative_returns.png)
+![分层累计收益示例](output/factor_37_cumulative_returns.png)
 *(注：跑单因子测试后会自动生成至 `output/` 目录)*
 
 **图表判读**：
 - 优秀的因子会呈现完美发散的多空序列图：所有分位数线条排列齐整，不互相交织。
 - 最顶部的组别（对于正向因子是 Top quantile）净值应稳健增长，而最底部的组别的净值应随时间下降。
 - 若线条互相纠缠或频繁横跳交叉，则表明因子多空表现不稳定，在震荡市或特定周期容易失效。
+
+#### C. 多空对冲与 Top-N 净值曲线
+
+- **多空对冲累计收益**
+![多空对冲累计收益](output/factor_37_long_short_cumulative.png)
+
+**图表判读**：
+展现买入最高分并做空最低分的绝对收益表现。持续向上的曲线代表因子具备稳定提供对冲 Alpha 的能力。
+
+- **Top-N 净值走势**：
+![Top-N 净值走势](output/factor_37_topn_nav.png)
+
+**图表判读**：
+重点考察单纯做多因子最看好（头部 N 只股票）的实际表现，并同时展现相对于基准的超额收益线。理想情况下，超额收益应稳定向上。
+
+#### D. IC / Rank IC 时序图
+
+- **IC 时序图**：
+![Top-N 净值走势](output/factor_37_ic_timeseries.png)
+
+**图表判读**：
+展现因子预测能力的时间序列平稳度。如果 IC 均线（如 22 日 MA）稳定维持在 0 轴之上或之下，说明因子预测方向持续有效。若围绕 0 轴剧烈震荡，说明因子极不稳定。

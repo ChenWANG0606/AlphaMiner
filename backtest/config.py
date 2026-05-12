@@ -4,14 +4,16 @@ from dotenv import load_dotenv
 # load environment variables from .env file
 load_dotenv()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 class Config:
     # JQData account configuration (read from .env file)
     JQ_USERNAME = os.getenv('JQ_USERNAME')
     JQ_PASSWORD = os.getenv('JQ_PASSWORD')
 
     # directory paths
-    DATA_DIR = 'data'
-    RES_DIR = 'output'
+    DATA_DIR = os.path.join(BASE_DIR, 'data')
+    RES_DIR = os.path.join(BASE_DIR, 'output')
 
     # data paths
     PATHS = {
@@ -22,12 +24,15 @@ class Config:
         'cash_flow_data': os.path.join(DATA_DIR, 'cash_flow.csv'),
         'income_data': os.path.join(DATA_DIR, 'income.csv'),
         'indicator_data': os.path.join(DATA_DIR, 'indicator.csv'),
-        'factor_jsonl': os.path.join(DATA_DIR, 'eval_records.jsonl'),
+        # 'factor_jsonl': os.path.join(BASE_DIR, '..', 'SFT', 'data', 'test_for_backtest.jsonl'),
+        'factor_jsonl': os.path.join(BASE_DIR, '..', 'SFT', 'output', 'eval_records_4b.jsonl'),
     }
     # backtest parameters
     BACKTEST = {
         'index_code': '000300.XSHG',
         'quantiles': 10,
+        'top_n': 50,
+        'factor_direction': 'auto',  # auto | positive | negative
         'periods': (1, 5, 22),
         'industry_level': 'jq_l1'
     }

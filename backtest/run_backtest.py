@@ -6,7 +6,7 @@ from factor_backtest import analyze_factor
 import os
 from datetime import datetime
 from config import Config
-
+from tqdm import tqdm 
 
 def make_panel(df, fields):
     panel_data = {}
@@ -44,7 +44,7 @@ def load_data():
     return data
 
 
-def run_pipeline(target_factor_id=None):
+def run_pipeline(target_factor_id=None, start_factor_id=None, jsonl_file_path=None):
     '''
     target_factor_id: Specify the factor ID for backtesting, e.g., 'factor_5'. If None, backtest all factors.
     '''
@@ -58,17 +58,34 @@ def run_pipeline(target_factor_id=None):
     print(f"Data loading complete. Number of available fields: {len(data.keys())}")
     
     # 2. Read jsonl file and execute functions
-    jsonl_file_path = Config.PATHS['factor_jsonl']
+    if jsonl_file_path is None:
+        jsonl_file_path = Config.PATHS['factor_jsonl']
+
     try:
         with open(jsonl_file_path, 'r', encoding='utf-8') as f:
             factor_info = [json.loads(line.strip()) for line in f if line.strip()]
     except FileNotFoundError:
         print(f"Cannot find {jsonl_file_path}")
-        return
+        return []
+
+    # ===> 新增: 解析断点续跑的起始索引
+    start_idx = 0
+    if start_factor_id is not None:
+        try:
+            start_idx = int(start_factor_id.replace('factor_', ''))
+            print(f"Resuming backtest from index {start_idx} ({start_factor_id})...")
+        except ValueError:
+            print(f"Invalid start_factor_id format: {start_factor_id}. Starting from 0.")
+
 
     # Factor backtesting
     print(f"Starting backtest for factors. Total factors in JSONL: {len(factor_info)}")
-    for i, info in enumerate(factor_info):
+    for i, info in enumerate(tqdm(factor_info, desc="Backtesting factors")):
+
+        # ===> 新增: 跳过起始索引之前的因子
+        if i < start_idx:
+            continue
+            
         factor_id = f"factor_{i}"
 
         # If a specific factor ID is specified, skip unmatched factors
@@ -104,7 +121,8 @@ def run_pipeline(target_factor_id=None):
                 factor_value,
                 quantiles=Config.BACKTEST['quantiles'],
                 periods=Config.BACKTEST['periods'],
-                industry=Config.BACKTEST['industry_level']
+                industry=Config.BACKTEST['industry_level'],
+                top_n=Config.BACKTEST.get('top_n', 50)
             )
             
             # Print daily IC
@@ -112,8 +130,25 @@ def run_pipeline(target_factor_id=None):
             
             # If testing a single factor, plot quantile and cumulative returns
             if target_factor_id is not None:
-                far.plot_quantile_returns(period=1, save_path=os.path.join(Config.RES_DIR, f'{factor_id}_quantile_returns.png'))
-                far.plot_cumulative_returns(period=1, save_path=os.path.join(Config.RES_DIR, f'{factor_id}_cumulative_returns.png'))
+                # Save the matched factor's original JSON object for traceability
+                with open('backtest/output/single_factor_test.jsonl', 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(info, ensure_ascii=False) + '\n')
+
+                set_period = 1          # 人为设置调仓周期
+                far.plot_quantile_returns(period=set_period, save_path=os.path.join(Config.RES_DIR, f'{factor_id}_quantile_returns.png'))
+                far.plot_cumulative_returns(period=set_period, save_path=os.path.join(Config.RES_DIR, f'{factor_id}_cumulative_returns.png'))
+                far.plot_topn_nav(
+                    period=set_period,
+                    top_n=Config.BACKTEST.get('top_n', 50),
+                    direction=Config.BACKTEST.get('factor_direction', 'auto'),
+                    save_path=os.path.join(Config.RES_DIR, f'{factor_id}_topn_nav.png')
+                )
+                far.plot_long_short_cumulative(
+                    period=set_period,
+                    direction=Config.BACKTEST.get('factor_direction', 'auto'),
+                    save_path=os.path.join(Config.RES_DIR, f'{factor_id}_long_short_cumulative.png')
+                )
+                far.plot_ic_timeseries(period=set_period, save_path=os.path.join(Config.RES_DIR, f'{factor_id}_ic_timeseries.png'))
             
             # Save all backtest results (12 indicators for 1, 5, 22 periods)
             res_row = {'Factor_ID': factor_id,
@@ -127,8 +162,8 @@ def run_pipeline(target_factor_id=None):
                     res_row[f'Rank_IC_{p}'] = far.rank_ic_summary.loc[p, 'IC_Mean'] # type: ignore
                     res_row[f'Rank_IR_{p}'] = far.rank_ic_summary.loc[p, 'IR'] # type: ignore
             
+
             res_df = pd.DataFrame([res_row])
-            
             # Append to CSV in real-time, write header if creating for the first time
             file_exists = os.path.exists(res_path)
             res_df.to_csv(res_path, mode='a', index=False, header=not file_exists)
@@ -143,6 +178,7 @@ def run_pipeline(target_factor_id=None):
         # If testing a single factor, break the loop after execution, stop iterating remaining factors
         if target_factor_id is not None and factor_id == target_factor_id:
             break
+
 
 if __name__ == '__main__':
     # Test all factors
