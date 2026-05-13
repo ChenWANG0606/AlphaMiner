@@ -35,11 +35,14 @@ SYSTEM_PROMPT = dedent(
     - factor_formula 必须单独给出清晰、可读的数学表达式或定义
     - factor_formula 中的变量名优先使用 required_inputs 中的英文字段名，并尽量与数据字典字段一致
     - required_inputs 只能列出实际参与计算的字段，不能多写，也不能漏写
-    - factor_python 必须是单个 compute_factor 函数
+    - factor_python 必须是单个 compute_factor 函数, 默认环境中已导入 pandas as pd 和 numpy as np
     - compute_factor 的参数必须与 required_inputs 完全一致，顺序也必须一致
     - 输入的每个参数都是 DataFrame，index=日期，columns=股票；输出也必须是同结构 DataFrame
-    - 不允许逐股票 for 循环，只允许 pandas / numpy 风格的宽表向量化计算
-    - 滚动窗口不得超过 252 个交易日或 12 个月
+    - 绝对禁止逐股票 for 循环，绝对禁止对 DataFrame 遍历 `for t in range(...)`，也不允许使用 `df[t]` 这种整数列索引,只允许 pandas / numpy 风格的宽表向量化计算
+    - 绝对禁止引入未来函数！计算只能使用历史数据，严禁在 shift() 中使用负数（如 shift(-1)）
+    - 因子公式必须具有现实的金融意义，绝不允许出现 `A - A`、`A / A`、`A * 0` 等导致计算结果为常数的无意义数学运算
+    - 注意除法安全！在 factor_python 中进行除法运算时，必须处理分母为 0 的情况（如将 0 替换为 NaN），防止产生 inf 异常
+    - 由于回测总数据量只有1年（252天），所有时间序列参数（包括但不限于 .rolling(window=...), .shift(periods=...), .pct_change(periods=...)）绝对不得超过 22！即使原始逻辑中明确要求“年度”、“12个月”或“252天”等长周期，也必须强制将其缩短或近似为22天以内
     - 所有计算必须能处理 NaN
     - 禁止 print、logging 和代码注释
     - 若原始逻辑依赖白名单外字段，应先做合理近似；无法近似时再写入 inavailable_inputs

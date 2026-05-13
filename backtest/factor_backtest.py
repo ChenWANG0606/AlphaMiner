@@ -10,12 +10,24 @@ from config import Config
 warnings.filterwarnings('ignore')
 
 class FactorAnalysisResult:
-    def __init__(self, ic_df, rank_ic_df, quantile_rets_dict):
+    def __init__(self, ic_df, rank_ic_df, quantile_rets_dict, topn_rets_dict):
         self.ic = ic_df
         self.rank_ic = rank_ic_df
         self.ic_summary = self._calc_summary(ic_df)
         self.rank_ic_summary = self._calc_summary(rank_ic_df)
         self.quantile_rets = quantile_rets_dict
+        self.topn_rets = topn_rets_dict
+
+    def _resolve_direction(self, period, direction='auto'):
+        direction = (direction or 'auto').lower()
+        if direction in ['positive', 'negative']:
+            return direction
+
+        if period in self.ic.columns:
+            ic_mean = self.ic[period].mean()
+            if pd.notna(ic_mean):
+                return 'positive' if ic_mean >= 0 else 'negative'
+        return 'positive'
         
     def _calc_summary(self, df):
         # Calculate IR = mean / std
@@ -69,6 +81,120 @@ class FactorAnalysisResult:
         else:
             plt.show()
 
+    def plot_topn_nav(self, period, save_path=None, top_n=50, direction='auto'):
+        if period not in self.topn_rets:
+            print(f"Top-N return data for period {period} not found")
+            return
+
+        df = self.topn_rets[period].copy()
+        if df.empty:
+            print(f"Top-N return data for period {period} is empty")
+            return
+
+        df = df.sort_index()
+        df.index = pd.to_datetime(df.index)
+        current_direction = self._resolve_direction(period, direction)
+        if current_direction == 'positive':
+            strategy_ret = df['top_ret']
+            strategy_name = f'Top {top_n} Long NAV'
+        else:
+            strategy_ret = df['bottom_ret']
+            strategy_name = f'Bottom {top_n} Long NAV'
+
+        nav_df = pd.DataFrame(index=df.index)
+        nav_df['strategy_nav'] = (1 + strategy_ret.fillna(0)).cumprod()
+        nav_df['benchmark_nav'] = (1 + df['benchmark_ret'].fillna(0)).cumprod()
+        nav_df['excess_nav'] = nav_df['strategy_nav'] / nav_df['benchmark_nav']
+
+        plt.figure(figsize=(11, 6))
+        plt.plot(nav_df.index, nav_df['strategy_nav'], label=strategy_name)
+        plt.plot(nav_df.index, nav_df['benchmark_nav'], label='HS300 Universe Equal-weight NAV')
+        plt.plot(nav_df.index, nav_df['excess_nav'], label='Excess NAV (Strategy / Benchmark)')
+        plt.title(
+            f'Period {period} NAV Curve (Start = 1, Current Direction: {current_direction.capitalize()})'
+        )
+        plt.xlabel('Time')
+        plt.ylabel('NAV')
+        plt.axhline(1, color='black', linewidth=1, linestyle='--')
+        plt.legend()
+        plt.gcf().autofmt_xdate()
+
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight')
+            plt.close()
+        else:
+            plt.show()
+
+    def plot_long_short_cumulative(self, period, save_path=None, direction='auto'):
+        if period not in self.quantile_rets:
+            print(f"Quantile data for period {period} not found")
+            return
+
+        df_rets = self.quantile_rets[period].copy()
+        if df_rets.empty or df_rets.shape[1] < 2:
+            print(f"Not enough quantile groups for long-short plot in period {period}")
+            return
+
+        cols_sorted = sorted(df_rets.columns)
+        low_q = cols_sorted[0]
+        high_q = cols_sorted[-1]
+        current_direction = self._resolve_direction(period, direction)
+        if current_direction == 'positive':
+            long_short = df_rets[high_q] - df_rets[low_q]
+            ls_label = f'Long Q{high_q} - Short Q{low_q}'
+        else:
+            long_short = df_rets[low_q] - df_rets[high_q]
+            ls_label = f'Long Q{low_q} - Short Q{high_q}'
+
+        long_short.index = pd.to_datetime(long_short.index)
+        long_short_cum = (1 + long_short.fillna(0)).cumprod()
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(long_short_cum.index, long_short_cum, label=ls_label)
+        plt.title(
+            f'Period {period} Long-Short Cumulative Returns (Current Direction: {current_direction.capitalize()})'
+        )
+        plt.xlabel('Time')
+        plt.ylabel('Cumulative Return')
+        plt.axhline(1, color='black', linewidth=1, linestyle='--')
+        plt.legend()
+        plt.gcf().autofmt_xdate()
+
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight')
+            plt.close()
+        else:
+            plt.show()
+
+    def plot_ic_timeseries(self, period, save_path=None, rolling_window=22):
+        if period not in self.ic.columns or period not in self.rank_ic.columns:
+            print(f"IC data for period {period} not found")
+            return
+
+        ic_ts = self.ic[period].copy()
+        rank_ic_ts = self.rank_ic[period].copy()
+        ic_ts.index = pd.to_datetime(ic_ts.index)
+        rank_ic_ts.index = pd.to_datetime(rank_ic_ts.index)
+
+        plt.figure(figsize=(11, 5))
+        plt.plot(ic_ts.index, ic_ts, alpha=0.4, label='IC')
+        plt.plot(rank_ic_ts.index, rank_ic_ts, alpha=0.4, label='Rank IC')
+        plt.plot(ic_ts.rolling(rolling_window).mean().index,
+                 ic_ts.rolling(rolling_window).mean(),
+                 linewidth=2, label=f'IC {rolling_window}D MA')
+        plt.axhline(0, color='black', linewidth=1, linestyle='--')
+        plt.title(f'Period {period} IC / Rank IC Time Series')
+        plt.xlabel('Time')
+        plt.ylabel('IC')
+        plt.legend()
+        plt.gcf().autofmt_xdate()
+
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight')
+            plt.close()
+        else:
+            plt.show()
+
 def get_industry_mapping(industry_path=Config.PATHS['industry_map'], industry_level=Config.BACKTEST['industry_level']):
     try:
         with open(industry_path, 'r', encoding='utf-8') as f:
@@ -114,7 +240,13 @@ def preprocess_cross_section(ds, ind_series):
         
     return res
 
-def analyze_factor(factor, quantiles=Config.BACKTEST['quantiles'], periods=Config.BACKTEST['periods'], industry=Config.BACKTEST['industry_level']):
+def analyze_factor(
+    factor,
+    quantiles=Config.BACKTEST['quantiles'],
+    periods=Config.BACKTEST['periods'],
+    industry=Config.BACKTEST['industry_level'],
+    top_n=Config.BACKTEST.get('top_n', 50)
+):
     print("Factor value industry standardization and extreme value removal...")
 
     # Type conversion: if the input is a Series with a multi-index (time, code), convert to DataFrame first
@@ -149,6 +281,7 @@ def analyze_factor(factor, quantiles=Config.BACKTEST['quantiles'], periods=Confi
     ic_dict = {}
     rank_ic_dict = {}
     quantile_rets_dict = {}
+    topn_rets_dict = {}
     
     print("Start calculating indicators...")
     for period in periods:
@@ -177,6 +310,7 @@ def analyze_factor(factor, quantiles=Config.BACKTEST['quantiles'], periods=Confi
         
         # Calculate the average future return corresponding to each quantile for each period
         q_rets = []
+        topn_rows = []
         for t in processed_factor.index:
             if t in fwd_ret.index and not fwd_ret.loc[t].isna().all():
                 # Safe grouped average calculation
@@ -185,13 +319,34 @@ def analyze_factor(factor, quantiles=Config.BACKTEST['quantiles'], periods=Confi
                     grp = fwd_ret.loc[t][valid_mask].groupby(q_groups.loc[t][valid_mask]).mean()
                     grp.name = t
                     q_rets.append(grp)
+
+                # Top-N long return and universe equal-weight benchmark return
+                valid_factor_mask = ~processed_factor.loc[t].isna() & ~fwd_ret.loc[t].isna()
+                if valid_factor_mask.any():
+                    f_t = processed_factor.loc[t][valid_factor_mask]
+                    r_t = fwd_ret.loc[t][valid_factor_mask]
+                    if not f_t.empty:
+                        top_codes = f_t.nlargest(min(top_n, len(f_t))).index
+                        bottom_codes = f_t.nsmallest(min(top_n, len(f_t))).index
+                        top_ret = r_t.loc[top_codes].mean()
+                        bottom_ret = r_t.loc[bottom_codes].mean()
+                        benchmark_ret = r_t.mean()
+                        topn_rows.append({
+                            'time': t,
+                            'top_ret': top_ret,
+                            'bottom_ret': bottom_ret,
+                            'benchmark_ret': benchmark_ret
+                        })
                 
         if q_rets:
             q_rets_df = pd.concat(q_rets, axis=1).T
             quantile_rets_dict[period] = q_rets_df
+        if topn_rows:
+            topn_df = pd.DataFrame(topn_rows).set_index('time')
+            topn_rets_dict[period] = topn_df
             
     # Organize results
     ic_df = pd.DataFrame(ic_dict)
     rank_ic_df = pd.DataFrame(rank_ic_dict)
     
-    return FactorAnalysisResult(ic_df, rank_ic_df, quantile_rets_dict)
+    return FactorAnalysisResult(ic_df, rank_ic_df, quantile_rets_dict, topn_rets_dict)
